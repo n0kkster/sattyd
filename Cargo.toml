@@ -49,6 +49,7 @@ fontconfig = "0.10.0"  # font loading
 keycode = "1.0.0"
 pango = "0.21.3"
 libc = "0.2.178"
+image = "0.25.9"
 
 [dependencies.relm4-icons]
 version = "0.10.0"
