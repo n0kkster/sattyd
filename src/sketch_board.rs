@@ -35,6 +35,7 @@ pub enum SketchBoardInput {
     RenderResult(RenderedImage, Vec<Action>),
     CommitEvent(TextEventMsg),
     Refresh,
+    LoadImage(Pixbuf),
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +43,7 @@ pub enum SketchBoardOutput {
     ToggleToolbarsDisplay,
     ToolSwitchShortcut(Tools),
     ColorSwitchShortcut(u64),
+    Exit,
 }
 
 #[derive(Debug, Clone)]
@@ -280,7 +282,7 @@ impl SketchBoard {
         rv
     }
 
-    fn handle_render_result(&self, image: RenderedImage, actions: Vec<Action>) {
+    fn handle_render_result(&self, image: RenderedImage, actions: Vec<Action>, sender: ComponentSender<Self>) {
         let needs_pixbuf = actions.iter().any(|action| {
             matches!(
                 action,
@@ -315,14 +317,14 @@ impl SketchBoard {
             }
 
             if APP_CONFIG.read().early_exit() || action == Action::Exit {
-                self.handle_exit();
+                sender.output_sender().emit(SketchBoardOutput::Exit);
                 return;
             }
         }
     }
 
-    fn handle_exit(&self) {
-        relm4::main_application().quit();
+    fn handle_exit(&self, sender: ComponentSender<Self>) {
+        sender.output_sender().emit(SketchBoardOutput::Exit);
     }
 
     fn handle_save(&self, image: &Pixbuf) {
@@ -739,7 +741,7 @@ impl Component for SketchBoard {
     type CommandOutput = ();
     type Input = SketchBoardInput;
     type Output = SketchBoardOutput;
-    type Init = Pixbuf;
+    type Init = Option<Pixbuf>;
 
     view! {
         gtk::Box {
@@ -871,6 +873,16 @@ impl Component for SketchBoard {
     fn update(&mut self, msg: SketchBoardInput, sender: ComponentSender<Self>, _root: &Self::Root) {
         // handle resize ourselves, pass everything else to tool
         let result = match msg {
+            SketchBoardInput::LoadImage(image) => {
+
+                self.renderer.init(
+                    sender.input_sender().clone(),
+                    self.tools.get_crop_tool(),
+                    self.active_tool.clone(),
+                    image,
+                );
+                ToolUpdateResult::Redraw
+            }
             SketchBoardInput::InputEvent(mut ie) => {
                 if let InputEvent::Key(ke) = ie {
                     let active_tool_result = self
@@ -988,7 +1000,7 @@ impl Component for SketchBoard {
                 self.handle_toolbar_event(toolbar_event, sender)
             }
             SketchBoardInput::RenderResult(img, action) => {
-                self.handle_render_result(img, action);
+                self.handle_render_result(img, action, sender); 
                 ToolUpdateResult::Unmodified
             }
             SketchBoardInput::CommitEvent(txt) => {
@@ -1012,7 +1024,7 @@ impl Component for SketchBoard {
     }
 
     fn init(
-        image: Self::Init,
+        image_opt: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
@@ -1028,6 +1040,11 @@ impl Component for SketchBoard {
             tools,
             im_context,
         };
+        
+        let image = image_opt.unwrap_or_else(|| {
+             Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 1, 1)
+                .expect("Failed to create dummy pixbuf")
+        });
 
         let area = &mut model.renderer;
         area.init(

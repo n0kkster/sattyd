@@ -9,7 +9,7 @@ pub struct CommandLine {
 
     /// Path to input image or '-' to read from stdin
     #[arg(short, long)]
-    pub filename: String,
+    pub filename: Option<String>,
 
     /// Start Satty in fullscreen mode
     #[arg(long)]
@@ -124,6 +124,11 @@ pub struct CommandLine {
     /// defaults to 50.0
     #[arg(long)]
     pub pan_step_size: Option<f32>,
+
+    /// Start Satty in daemon mode to reduce subsequent startups time
+    /// defaults to falss
+    #[arg(long, action)]
+    pub daemon: bool,
     // ---
 }
 

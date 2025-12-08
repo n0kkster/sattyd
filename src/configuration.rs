@@ -59,6 +59,7 @@ pub struct Configuration {
     keybinds: Keybinds,
     zoom_factor: f32,
     pan_step_size: f32,
+    daemon: bool,
 }
 
 pub struct Keybinds {
@@ -305,8 +306,12 @@ impl Configuration {
         // ---
     }
     fn merge(&mut self, file: Option<ConfigurationFile>, command_line: CommandLine) {
-        // input_filename is required and needs to be overwritten
-        self.input_filename = command_line.filename;
+        // input_filename is not required anymore
+        self.input_filename = command_line.filename.unwrap_or_else(|| "-".to_string());
+
+        if command_line.daemon {
+            self.daemon = true;
+        }
 
         // overwrite with all specified values from config file
         if let Some(file) = file {
@@ -509,6 +514,10 @@ impl Configuration {
     pub fn pan_step_size(&self) -> f32 {
         self.pan_step_size
     }
+
+    pub fn daemon_mode(&self) -> bool {
+        self.daemon
+    }
 }
 
 impl Default for Configuration {
@@ -539,6 +548,7 @@ impl Default for Configuration {
             keybinds: Keybinds::default(),
             zoom_factor: 1.1,
             pan_step_size: 50.,
+            daemon: false,
         }
     }
 }

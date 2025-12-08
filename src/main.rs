@@ -1,11 +1,14 @@
-use std::io::Read;
+use std::io::{self, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::LazyLock;
-use std::{fs, ptr};
-use std::{io, time::Duration};
+use std::{fs, ptr, thread};
+use std::time::Duration;
+use std::path::PathBuf;
 
 use configuration::{Configuration, APP_CONFIG};
 use gdk_pixbuf::gio::ApplicationFlags;
-use gdk_pixbuf::{Pixbuf, PixbufLoader};
+use gdk_pixbuf::{Pixbuf, PixbufLoader, Colorspace};
+use gdk_pixbuf::glib::Bytes;
 use gtk::prelude::*;
 
 use relm4::gtk::gdk::Rectangle;
@@ -17,7 +20,7 @@ use relm4::{
 
 use anyhow::{anyhow, Context, Result};
 
-use sketch_board::SketchBoardOutput;
+use sketch_board::{SketchBoardOutput, SketchBoardInput};
 use ui::toolbars::{StyleToolbar, StyleToolbarInput, ToolsToolbar, ToolsToolbarInput};
 use xdg::BaseDirectories;
 
@@ -32,11 +35,81 @@ mod style;
 mod tools;
 mod ui;
 
-use crate::sketch_board::{SketchBoard, SketchBoardInput};
+use crate::sketch_board::SketchBoard;
 use crate::tools::Tools;
 
 pub static START_TIME: LazyLock<chrono::DateTime<chrono::Local>> =
     LazyLock::new(chrono::Local::now);
+
+#[derive(Debug, Clone)]
+struct RawImageData {
+    width: i32,
+    height: i32,
+    n_channels: i32,
+    rowstride: i32,
+    data: Vec<u8>,
+}
+
+fn get_socket_path() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    std::env::temp_dir().join(format!("satty-{}.sock", uid))
+}
+
+fn try_send_to_daemon(image: &Pixbuf) -> bool {
+    let socket_path = get_socket_path();
+    let mut stream = match UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let width = image.width();
+    let height = image.height();
+    let n_channels = image.n_channels();
+    let rowstride = image.rowstride();
+    
+    let byte_struct = image.read_pixel_bytes();
+    let pixels = byte_struct.as_ref();
+
+    if stream.write_all(&width.to_be_bytes()).is_err() { return false; }
+    if stream.write_all(&height.to_be_bytes()).is_err() { return false; }
+    if stream.write_all(&n_channels.to_be_bytes()).is_err() { return false; }
+    if stream.write_all(&rowstride.to_be_bytes()).is_err() { return false; }
+    if stream.write_all(&(pixels.len() as u64).to_be_bytes()).is_err() { return false; }
+    if stream.write_all(pixels).is_err() { return false; }
+
+    true
+}
+
+fn read_raw_image_from_stream(mut stream: UnixStream) -> Option<RawImageData> {
+    let mut u32_buf = [0u8; 4];
+    let mut u64_buf = [0u8; 8];
+
+    stream.read_exact(&mut u32_buf).ok()?;
+    let width = i32::from_be_bytes(u32_buf);
+
+    stream.read_exact(&mut u32_buf).ok()?;
+    let height = i32::from_be_bytes(u32_buf);
+
+    stream.read_exact(&mut u32_buf).ok()?;
+    let n_channels = i32::from_be_bytes(u32_buf);
+
+    stream.read_exact(&mut u32_buf).ok()?;
+    let rowstride = i32::from_be_bytes(u32_buf);
+
+    stream.read_exact(&mut u64_buf).ok()?;
+    let data_len = u64::from_be_bytes(u64_buf) as usize;
+
+    let mut buffer = vec![0u8; data_len];
+    stream.read_exact(&mut buffer).ok()?;
+
+    Some(RawImageData {
+        width,
+        height,
+        n_channels,
+        rowstride,
+        data: buffer,
+    })
+}
 
 macro_rules! generate_profile_output {
     ($e: expr) => {
@@ -55,6 +128,7 @@ struct App {
     sketch_board: Controller<SketchBoard>,
     tools_toolbar: Controller<ToolsToolbar>,
     style_toolbar: Controller<StyleToolbar>,
+    is_daemon: bool,
 }
 
 #[derive(Debug)]
@@ -64,6 +138,8 @@ enum AppInput {
     ToggleToolbarsDisplay,
     ToolSwitchShortcut(Tools),
     ColorSwitchShortcut(u64),
+    LoadImage(RawImageData),
+    Exit,
 }
 
 #[derive(Debug)]
@@ -96,20 +172,13 @@ impl App {
         let image_width = self.image_dimensions.0 as f64;
         let image_height = self.image_dimensions.1 as f64;
 
-        // create a window that uses 80% of the available space max
-        // if necessary, scale down image
         if reduced_monitor_width > image_width && reduced_monitor_height > image_height {
-            // set window to exact size
             root.set_default_size(self.image_dimensions.0, self.image_dimensions.1);
         } else {
-            // scale down and use windowed mode
             let aspect_ratio = image_width / image_height;
-
-            // resize
             let mut new_width = reduced_monitor_width;
             let mut new_height = new_width / aspect_ratio;
 
-            // if new_height is still bigger than monitor height, then scale on monitor height
             if new_height > reduced_monitor_height {
                 new_height = reduced_monitor_height;
                 new_width = new_height * aspect_ratio;
@@ -124,8 +193,6 @@ impl App {
             root.fullscreen();
         }
 
-        // this is a horrible hack to let sway recognize the window as "not resizable" and
-        // place it floating mode. We then re-enable resizing to let if fit fullscreen (if requested)
         sender.command(|out, shutdown| {
             shutdown
                 .register(async move {
@@ -169,7 +236,7 @@ impl App {
 
 #[relm4::component]
 impl Component for App {
-    type Init = Pixbuf;
+    type Init = Option<Pixbuf>; 
     type Input = AppInput;
     type Output = ();
     type CommandOutput = AppCommandOutput;
@@ -179,17 +246,29 @@ impl Component for App {
             set_decorated: !APP_CONFIG.read().no_window_decoration(),
             set_default_size: (500, 500),
             add_css_class: "root",
+            
+            // ИСПРАВЛЕНИЕ 1: используем set_visible вместо visible
+            set_visible: false,
+
+            // ИСПРАВЛЕНИЕ 2: захватываем [sender], так как он существует в области видимости.
+            // Внутри замыкания он не используется, но это стандартный способ захвата в макросах Relm4.
+            connect_close_request[sender] => move |window| {
+                if model.is_daemon {
+                    window.set_visible(false);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            },
 
             connect_show[sender] => move |_| {
                 generate_profile_output!("gui show event");
                 sender.input(AppInput::Realized);
             },
-
+            
             gtk::Overlay {
                 add_overlay = model.tools_toolbar.widget(),
-
                 add_overlay = model.style_toolbar.widget(),
-
                 model.sketch_board.widget(),
             }
         }
@@ -197,6 +276,30 @@ impl Component for App {
 
     fn update(&mut self, message: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
         match message {
+            AppInput::Exit => {
+                // Закрываем окно. Поведение определится в connect_close_request
+                root.close();
+            }
+            AppInput::LoadImage(raw_img) => {
+                self.image_dimensions = (raw_img.width, raw_img.height);
+                
+                let bytes = Bytes::from(&raw_img.data);
+                let pixbuf = Pixbuf::from_bytes(
+                    &bytes,
+                    Colorspace::Rgb,
+                    raw_img.n_channels == 4,
+                    8,
+                    raw_img.width,
+                    raw_img.height,
+                    raw_img.rowstride
+                );
+
+                self.sketch_board.sender().emit(SketchBoardInput::LoadImage(pixbuf));
+                
+                root.set_visible(true); 
+                root.present();
+                self.resize_window_initial(root, sender);
+            }
             AppInput::Realized => self.resize_window_initial(root, sender),
             AppInput::SetToolbarsDisplay(visible) => {
                 self.tools_toolbar
@@ -241,18 +344,46 @@ impl Component for App {
     }
 
     fn init(
-        image: Self::Init,
+        image_opt: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         Self::apply_style();
 
-        let image_dimensions = (image.width(), image.height());
+        let is_daemon = image_opt.is_none();
+
+        if is_daemon {
+            let sender = sender.clone();
+            thread::spawn(move || {
+                let socket_path = get_socket_path();
+                if socket_path.exists() {
+                    let _ = fs::remove_file(&socket_path);
+                }
+                
+                if let Ok(listener) = UnixListener::bind(&socket_path) {
+                    for stream in listener.incoming() {
+                        if let Ok(stream) = stream {
+                            if let Some(raw_img) = read_raw_image_from_stream(stream) {
+                                sender.input(AppInput::LoadImage(raw_img));
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("Failed to bind socket: {:?}", socket_path);
+                }
+            });
+        }
+
+        let image_dimensions = if let Some(ref img) = image_opt {
+             (img.width(), img.height())
+        } else {
+             (500, 500)
+        };
 
         // SketchBoard
         let sketch_board =
             SketchBoard::builder()
-                .launch(image)
+                .launch(image_opt.clone())
                 .forward(sender.input_sender(), |t| match t {
                     SketchBoardOutput::ToggleToolbarsDisplay => AppInput::ToggleToolbarsDisplay,
                     SketchBoardOutput::ToolSwitchShortcut(tool) => {
@@ -261,6 +392,7 @@ impl Component for App {
                     SketchBoardOutput::ColorSwitchShortcut(index) => {
                         AppInput::ColorSwitchShortcut(index)
                     }
+                    SketchBoardOutput::Exit => AppInput::Exit,
                 });
 
         // Toolbars
@@ -278,6 +410,7 @@ impl Component for App {
             tools_toolbar,
             style_toolbar,
             image_dimensions,
+            is_daemon,
         };
 
         let widgets = view_output!();
@@ -298,8 +431,18 @@ impl Component for App {
 
         generate_profile_output!("app init end");
 
+        let root_clone = root.clone();
         glib::idle_add_local_once(move || {
             generate_profile_output!("main loop idle");
+            
+            // ХАК: Relm4 любит показывать окно сам после init.
+            // Мы принудительно скрываем его на первом такте цикла, если мы демон.
+            if is_daemon {
+                root_clone.set_visible(false);
+            } else {
+                // Если не демон - показываем
+                root_clone.set_visible(true);
+            }
         });
 
         ComponentParts { model, widgets }
@@ -311,28 +454,19 @@ fn read_css_overrides() -> Option<String> {
     let path = dirs.get_config_file("overrides.css")?;
 
     if !path.exists() {
-        eprintln!(
-            "CSS overrides file {} does not exist, using builtin CSS only.",
-            &path.display()
-        );
         return None;
     }
 
     match fs::read_to_string(&path) {
         Ok(content) => Some(content),
         Err(e) => {
-            eprintln!(
-                "failed to read CSS overrides from {} with error: {}",
-                &path.display(),
-                e
-            );
+            eprintln!("failed to read CSS overrides: {}", e);
             None
         }
     }
 }
 
 fn load_gl() -> Result<()> {
-    // Load GL pointers from epoxy (GL context management library used by GTK).
     #[cfg(target_os = "macos")]
     let library = unsafe { libloading::os::unix::Library::new("libepoxy.0.dylib") }?;
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -351,48 +485,92 @@ fn load_gl() -> Result<()> {
 }
 
 fn run_satty() -> Result<()> {
-    // load OpenGL
     load_gl()?;
     generate_profile_output!("loaded gl");
 
-    // load app config
     let config = APP_CONFIG.read();
 
+    if config.daemon_mode() {
+        let socket_path = get_socket_path();
+        
+        if UnixStream::connect(&socket_path).is_ok() {
+            eprintln!("Satty daemon is already running!");
+            return Ok(());
+        }
+
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path);
+        }
+
+        generate_profile_output!("starting in DAEMON mode");
+        
+        let app = relm4::main_application();
+        app.set_application_id(Some("com.gabm.satty"));
+        app.set_flags(ApplicationFlags::NON_UNIQUE);
+        
+        let app = RelmApp::from_app(app).with_args(vec![]);
+        relm4_icons::initialize_icons(
+            icons::icon_names::GRESOURCE_BYTES,
+            icons::icon_names::RESOURCE_PREFIX,
+        );
+        
+        app.run::<App>(None);
+
+        if socket_path.exists() {
+            let _ = fs::remove_file(socket_path);
+        }
+        return Ok(());
+    }
+
     generate_profile_output!("loading image");
-    // load input image
-    let image = if config.input_filename() == "-" {
+    
+    let image_result = if config.input_filename() == "-" {
         let mut buf = Vec::<u8>::new();
-        io::stdin().lock().read_to_end(&mut buf)?;
-        let pb_loader = PixbufLoader::new();
-        pb_loader.write(&buf)?;
-        pb_loader.close()?;
-        pb_loader
-            .pixbuf()
-            .ok_or(anyhow!("Conversion to Pixbuf failed"))?
+        match io::stdin().lock().read_to_end(&mut buf) {
+            Ok(_) if !buf.is_empty() => {
+                 let pb_loader = PixbufLoader::new();
+                 pb_loader.write(&buf)?;
+                 pb_loader.close()?;
+                 pb_loader.pixbuf().context("Conversion to Pixbuf failed")
+            }
+            _ => Err(anyhow!("No input data provided. Use --daemon or provide a file/stdin.")),
+        }
     } else {
-        Pixbuf::from_file(config.input_filename()).context("couldn't load image")?
+        Pixbuf::from_file(config.input_filename()).context("couldn't load image")
     };
 
-    generate_profile_output!("image loaded, starting gui");
-    // start GUI
-    let app = relm4::main_application();
-    app.set_application_id(Some("com.gabm.satty"));
-    // set flag to allow to run multiple instances
-    app.set_flags(ApplicationFlags::NON_UNIQUE);
-    // create relm app and run
-    let app = RelmApp::from_app(app).with_args(vec![]);
-    relm4_icons::initialize_icons(
-        icons::icon_names::GRESOURCE_BYTES,
-        icons::icon_names::RESOURCE_PREFIX,
-    );
-    app.run::<App>(image);
-    Ok(())
+    match image_result {
+        Ok(image) => {
+            if try_send_to_daemon(&image) {
+                generate_profile_output!("Sent to daemon, exiting");
+                return Ok(());
+            }
+
+            generate_profile_output!("starting gui (standalone)");
+            
+            let app = relm4::main_application();
+            app.set_application_id(Some("com.gabm.satty"));
+            app.set_flags(ApplicationFlags::NON_UNIQUE);
+            
+            let app = RelmApp::from_app(app).with_args(vec![]);
+            relm4_icons::initialize_icons(
+                icons::icon_names::GRESOURCE_BYTES,
+                icons::icon_names::RESOURCE_PREFIX,
+            );
+            
+            app.run::<App>(Some(image));
+            
+            Ok(())
+        },
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            Err(e)
+        }
+    }
 }
 
 fn main() -> Result<()> {
     let _ = *START_TIME;
-    // populate the APP_CONFIG from commandline and
-    // config file. this might exit, if an error occurred.
     Configuration::load();
     if APP_CONFIG.read().profile_startup() {
         eprintln!(
@@ -402,11 +580,9 @@ fn main() -> Result<()> {
     }
     generate_profile_output!("configuration loaded");
 
-    // run the application
     match run_satty() {
-        Err(e) => {
-            eprintln!("Error: {e}");
-            Err(e)
+        Err(_e) => {
+            std::process::exit(1);
         }
         Ok(v) => Ok(v),
     }

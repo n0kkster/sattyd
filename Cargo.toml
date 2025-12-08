@@ -48,6 +48,7 @@ resource = "0.6.1"  # font emedding
 fontconfig = "0.10.0"  # font loading
 keycode = "1.0.0"
 pango = "0.21.3"
+libc = "0.2.178"
 
 [dependencies.relm4-icons]
 version = "0.10.0"
@@ -76,3 +77,10 @@ license = "MPL-2.0"
 [workspace.dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
 satty_cli = { path = "cli" }
+
+[profile.release]
+lto = "fat"        # Включает Link Time Optimization (сильно помогает)
+codegen-units = 1  # Замедляет сборку, но код получается быстрее
+panic = "abort"    # Уменьшает размер бинарника
+strip = true       # Удаляет отладочные символы
+opt-level = 3      # Максимальная оптимизация
